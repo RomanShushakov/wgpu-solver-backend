@@ -1,8 +1,10 @@
 use bytemuck::{Pod, cast_slice};
 use futures::channel::oneshot;
 use std::mem::size_of;
-use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Device, MapMode, Queue};
 use wgpu::PollType;
+use wgpu::{
+    Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Device, MapMode, Queue,
+};
 
 pub async fn readback_to_vec<T: Pod>(
     device: &Device,
@@ -35,7 +37,9 @@ pub async fn readback_to_vec<T: Pod>(
     });
 
     // Ensure mapping completes.
-    device.poll(PollType::wait_indefinitely()).expect("error at polling");
+    device
+        .poll(PollType::wait_indefinitely())
+        .expect("error at polling");
 
     rx.await
         .expect("map_async callback dropped")
@@ -45,6 +49,36 @@ pub async fn readback_to_vec<T: Pod>(
     let out = cast_slice::<u8, T>(&data).to_vec();
     drop(data);
     staging.unmap();
+
+    out
+}
+
+/// Read a buffer that was created with MAP_READ usage.
+/// (No extra staging buffer, no GPU->GPU copy performed here.)
+pub async fn read_mapped_buffer_to_vec<T: Pod>(
+    device: &Device,
+    buffer: &Buffer,
+    len: usize,
+) -> Vec<T> {
+    let slice = buffer.slice(..);
+
+    let (tx, rx) = oneshot::channel();
+    slice.map_async(MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+
+    device
+        .poll(PollType::wait_indefinitely())
+        .expect("error at polling");
+
+    rx.await
+        .expect("map_async callback dropped")
+        .expect("map_async failed");
+
+    let data = slice.get_mapped_range();
+    let out = cast_slice::<u8, T>(&data).to_vec();
+    drop(data);
+    buffer.unmap();
 
     out
 }

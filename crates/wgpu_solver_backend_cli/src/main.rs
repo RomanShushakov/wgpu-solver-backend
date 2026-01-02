@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::to_string_pretty;
 use std::process::exit;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use wgpu::{BufferUsages, CommandEncoderDescriptor};
+use wgpu_solver_backend::compute::dot_scalar_exec::DotScalarExecutor;
 use wgpu_solver_backend::compute::vec_ops_exec::VecOpsExecutor;
 use wgpu_solver_backend::gpu::context::{GpuBackend, GpuContext};
 
@@ -27,6 +29,7 @@ enum Command {
     Info,
     /// Sanity test for vec ops (AXPY): y = y + alpha * x
     VecTest,
+    DotTest,
 }
 
 #[derive(Serialize)]
@@ -113,6 +116,43 @@ fn run_vec_test(ctx: &GpuContext) {
     println!("VecTest OK: all y[i] == {expected}");
 }
 
+fn run_dot_test(ctx: &GpuContext) {
+    // dot([1,2,3], [4,5,6]) = 1*4 + 2*5 + 3*6 = 32
+    let a = vec![1.0f32, 2.0, 3.0];
+    let b = vec![4.0f32, 5.0, 6.0];
+    let n = a.len() as u32;
+
+    let a_buf = ctx.create_storage_buffer("dot a", &a, BufferUsages::empty());
+    let b_buf = ctx.create_storage_buffer("dot b", &b, BufferUsages::empty());
+
+    // Allocate executor for up to n elements, and 4 scalar slots.
+    let exec = DotScalarExecutor::create(ctx, a.len(), 4);
+    exec.reset_params_cursor();
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("dot-test encoder"),
+        });
+
+    exec.encode_dot_scalar_into(ctx, &mut encoder, &a_buf.buffer, &b_buf.buffer, n, 0);
+    exec.encode_copy_scalar_results_to_readback(&mut encoder);
+
+    ctx.queue.submit(Some(encoder.finish()));
+
+    let scalars = futures::executor::block_on(exec.readback_scalar_results(ctx));
+
+    let got = scalars[0];
+    let expected = 32.0f32;
+
+    assert!(
+        (got - expected).abs() < 1e-5,
+        "dot-test failed: got {got}, expected {expected}"
+    );
+
+    println!("DotTest OK: got {got}");
+}
+
 fn main() {
     let cli = Cli::parse();
     let gpu_backend = parse_backend(&cli.backend);
@@ -153,6 +193,14 @@ fn main() {
             });
 
             run_vec_test(&ctx);
+        }
+        Command::DotTest => {
+            let ctx = block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
+                eprintln!("Failed to init GPU context: {e}");
+                std::process::exit(2);
+            });
+
+            run_dot_test(&ctx);
         }
     }
 }
