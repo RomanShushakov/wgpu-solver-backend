@@ -5,10 +5,12 @@ use serde_json::to_string_pretty;
 use std::process::exit;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wgpu::{BufferUsages, CommandEncoderDescriptor};
+use wgpu_solver_backend::compute::block_jacobi_exec::BlockJacobiExecutor;
 use wgpu_solver_backend::compute::dot_scalar_exec::DotScalarExecutor;
 use wgpu_solver_backend::compute::spmv_exec::SpmvExecutor;
 use wgpu_solver_backend::compute::vec_ops_exec::VecOpsExecutor;
 use wgpu_solver_backend::gpu::context::{GpuBackend, GpuContext};
+use wgpu_solver_backend::gpu::readback::readback_to_vec;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +34,7 @@ enum Command {
     VecTest,
     DotTest,
     SpmvTest,
+    BlockJacobiTest,
 }
 
 #[derive(Serialize)]
@@ -155,7 +158,7 @@ fn run_dot_test(ctx: &GpuContext) {
     println!("DotTest OK: got {got}");
 }
 
-fn run_spmv_test(ctx: &wgpu_solver_backend::gpu::context::GpuContext) {
+fn run_spmv_test(ctx: &GpuContext) {
     // 3x3 matrix:
     // [ 10 0  2 ]
     // [ 3  9  0 ]
@@ -200,7 +203,7 @@ fn run_spmv_test(ctx: &wgpu_solver_backend::gpu::context::GpuContext) {
 
     // Read back y.
     // y_buffer length is n_rows f32.
-    let y_out: Vec<f32> = block_on(wgpu_solver_backend::gpu::readback::readback_to_vec::<f32>(
+    let y_out: Vec<f32> = block_on(readback_to_vec::<f32>(
         &ctx.device,
         &ctx.queue,
         spmv.y_buffer(),
@@ -220,6 +223,59 @@ fn run_spmv_test(ctx: &wgpu_solver_backend::gpu::context::GpuContext) {
     }
 
     println!("SpmvTest OK: y == {:?}", y_out);
+}
+
+fn run_block_jacobi_test(ctx: &GpuContext) {
+    // Two 6x6 blocks => n = 12
+    let n: u32 = 12;
+
+    // block_starts: [0, 6, 12]
+    let block_starts: Vec<u32> = vec![0, 6, 12];
+
+    // Identity LU blocks: 2 blocks * 36 floats each
+    let mut lu_blocks = vec![0.0f32; 2 * 36];
+    for b in 0..2 {
+        for i in 0..6 {
+            lu_blocks[b * 36 + i * 6 + i] = 1.0;
+        }
+    }
+
+    // r = [1..12]
+    let r_host: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+
+    // Upload r and allocate z
+    let r_gpu = ctx.create_storage_buffer("bj-test r", &r_host, BufferUsages::empty());
+    let z_gpu =
+        ctx.create_storage_buffer_uninit::<f32>("bj-test z", n as usize, BufferUsages::COPY_SRC);
+
+    // Create executor
+    let bj = BlockJacobiExecutor::create(ctx, n, &lu_blocks, &block_starts);
+
+    // Encode apply and submit once
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("block-jacobi-test encoder"),
+        });
+
+    bj.encode_apply(ctx, &mut encoder, &r_gpu.buffer, &z_gpu.buffer);
+
+    ctx.queue.submit(Some(encoder.finish()));
+
+    // Read back z
+    let z_out = block_on(ctx.readback(&z_gpu));
+
+    // Assert z == r
+    for i in 0..(n as usize) {
+        let got = z_out[i];
+        let exp = r_host[i];
+        assert!(
+            (got - exp).abs() < 1e-6,
+            "block-jacobi-test failed at i={i}: got {got}, expected {exp}"
+        );
+    }
+
+    println!("BlockJacobiTest OK: z == r (identity blocks)");
 }
 
 fn main() {
@@ -278,6 +334,15 @@ fn main() {
             });
 
             run_spmv_test(&ctx);
+        }
+        Command::BlockJacobiTest => {
+            let ctx =
+                futures::executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
+                    eprintln!("Failed to init GPU context: {e}");
+                    std::process::exit(2);
+                });
+
+            run_block_jacobi_test(&ctx);
         }
     }
 }
