@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use futures::executor;
 use serde::Serialize;
 use serde_json::to_string_pretty;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::process;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -30,11 +31,11 @@ struct Cli {
     backend: String,
 
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
+enum Cmd {
     /// Print GPU adapter info and emit a metrics JSON blob (stdout).
     Info,
     /// Sanity test for vec ops (AXPY): y = y + alpha * x
@@ -68,6 +69,28 @@ enum Command {
         /// Where to write metrics.json
         #[arg(long)]
         out_metrics: String,
+    },
+    /// Compare two solution vectors stored in .bin format (u32 len + f32[len])
+    CompareX {
+        /// Path to reference x_ref.bin
+        #[arg(long)]
+        x_ref: String,
+
+        /// Path to produced x.bin (backend output)
+        #[arg(long)]
+        x: String,
+
+        /// Relative tolerance
+        #[arg(long, default_value_t = 1e-3)]
+        rel_tol: f32,
+
+        /// Absolute tolerance
+        #[arg(long, default_value_t = 1e-4)]
+        abs_tol: f32,
+
+        /// Show top-k worst indices
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
     },
 }
 
@@ -536,12 +559,171 @@ fn run_pcg_case(
     Ok((iters, x, case.a.n_rows, nnz))
 }
 
+fn read_f32_vec_bin(path: &str) -> Result<Vec<f32>, String> {
+    let mut f = File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+
+    let mut n_bytes = [0u8; 4];
+    f.read_exact(&mut n_bytes)
+        .map_err(|e| format!("read len header {path}: {e}"))?;
+    let n = u32::from_le_bytes(n_bytes) as usize;
+
+    let mut out = vec![0.0f32; n];
+    let mut buf = [0u8; 4];
+
+    for i in 0..n {
+        f.read_exact(&mut buf)
+            .map_err(|e| format!("read f32[{i}] {path}: {e}"))?;
+        out[i] = f32::from_le_bytes(buf);
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug)]
+struct CompareStats {
+    n: usize,
+
+    // norms
+    l2_ref: f64,
+    l2_err: f64,
+    rel_l2: f64,
+    rmse: f64,
+
+    // diagnostics only
+    max_abs_err: f32,
+    worst: Vec<WorstEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct WorstEntry {
+    i: usize,
+    x_ref: f32,
+    x: f32,
+    abs_err: f32,
+}
+
+fn compare_x_vectors(x_ref: &[f32], x: &[f32], top_k: usize) -> CompareStats {
+    let n = x_ref.len().min(x.len());
+
+    let mut sum_sq_err = 0.0f64;
+    let mut sum_sq_ref = 0.0f64;
+
+    let mut max_abs_err = 0.0f32;
+
+    let mut worst: Vec<WorstEntry> = Vec::with_capacity(top_k);
+
+    for i in 0..n {
+        let a = x_ref[i];
+        let b = x[i];
+        let abs_err = (b - a).abs();
+
+        max_abs_err = max_abs_err.max(abs_err);
+
+        sum_sq_err += (abs_err as f64) * (abs_err as f64);
+        sum_sq_ref += (a as f64) * (a as f64);
+
+        if top_k > 0 {
+            if worst.len() < top_k {
+                worst.push(WorstEntry {
+                    i,
+                    x_ref: a,
+                    x: b,
+                    abs_err,
+                });
+                worst.sort_by(|p, q| q.abs_err.partial_cmp(&p.abs_err).unwrap());
+            } else if abs_err > worst.last().unwrap().abs_err {
+                worst.pop();
+                worst.push(WorstEntry {
+                    i,
+                    x_ref: a,
+                    x: b,
+                    abs_err,
+                });
+                worst.sort_by(|p, q| q.abs_err.partial_cmp(&p.abs_err).unwrap());
+            }
+        }
+    }
+
+    let l2_err = sum_sq_err.sqrt();
+    let l2_ref = sum_sq_ref.sqrt();
+
+    let eps = 1e-30f64;
+    let rel_l2 = l2_err / l2_ref.max(eps);
+
+    let rmse = (sum_sq_err / (n.max(1) as f64)).sqrt();
+
+    CompareStats {
+        n,
+        l2_ref,
+        l2_err,
+        rel_l2,
+        rmse,
+        max_abs_err,
+        worst,
+    }
+}
+
+fn run_compare_x(
+    x_ref_path: &str,
+    x_path: &str,
+    rel_tol: f32,
+    abs_tol: f32,
+    top_k: usize,
+) -> Result<(), String> {
+    let x_ref = read_f32_vec_bin(x_ref_path)?;
+    let x = read_f32_vec_bin(x_path)?;
+
+    if x_ref.len() != x.len() {
+        return Err(format!(
+            "Length mismatch: x_ref len {} vs x len {}",
+            x_ref.len(),
+            x.len()
+        ));
+    }
+
+    let stats = compare_x_vectors(&x_ref, &x, top_k);
+
+    // PASS criteria:
+    // - relative L2 error small OR
+    // - RMSE small
+    let pass_rel = stats.rel_l2 <= (rel_tol as f64);
+    let pass_rmse = stats.rmse <= (abs_tol as f64);
+    let pass = pass_rel || pass_rmse;
+
+    println!("CompareX:");
+    println!("  n                 : {}", stats.n);
+    println!("  rtol (rel L2)      : {:.3e}", rel_tol);
+    println!("  atol (RMSE)        : {:.3e}", abs_tol);
+    println!("  ||x_ref||_2        : {:.9e}", stats.l2_ref);
+    println!("  ||x - x_ref||_2    : {:.9e}", stats.l2_err);
+    println!("  rel_l2             : {:.9e}", stats.rel_l2);
+    println!("  rmse               : {:.9e}", stats.rmse);
+    println!("  max_abs_err (diag) : {:.9e}", stats.max_abs_err);
+    println!("  pass               : {}", pass);
+
+    if !stats.worst.is_empty() {
+        println!("\nTop {} worst entries (by abs error):", stats.worst.len());
+        for w in &stats.worst {
+            println!(
+                "  i={:<8} x_ref={:.9e}  x={:.9e}  abs={:.9e}",
+                w.i, w.x_ref, w.x, w.abs_err
+            );
+        }
+    }
+
+    if pass {
+        Ok(())
+    } else {
+        Err("CompareX failed tolerances (rel_l2 and rmse)".into())
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let gpu_backend = parse_backend(&cli.backend);
 
     match cli.cmd {
-        Command::Info => {
+        Cmd::Info => {
             let ctx = executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
                 eprintln!("Failed to init GPU context: {e}");
                 process::exit(2);
@@ -569,7 +751,7 @@ fn main() {
 
             println!("{}", to_string_pretty(&metrics).unwrap());
         }
-        Command::VecTest => {
+        Cmd::VecTest => {
             let ctx: GpuContext = executor::block_on(GpuContext::create(gpu_backend))
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to init GPU context: {e}");
@@ -578,7 +760,7 @@ fn main() {
 
             run_vec_test(&ctx);
         }
-        Command::DotTest => {
+        Cmd::DotTest => {
             let ctx = executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
                 eprintln!("Failed to init GPU context: {e}");
                 process::exit(2);
@@ -586,7 +768,7 @@ fn main() {
 
             run_dot_test(&ctx);
         }
-        Command::SpmvTest => {
+        Cmd::SpmvTest => {
             let ctx = executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
                 eprintln!("Failed to init GPU context: {e}");
                 process::exit(2);
@@ -594,7 +776,7 @@ fn main() {
 
             run_spmv_test(&ctx);
         }
-        Command::BlockJacobiTest => {
+        Cmd::BlockJacobiTest => {
             let ctx = executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
                 eprintln!("Failed to init GPU context: {e}");
                 process::exit(2);
@@ -602,7 +784,7 @@ fn main() {
 
             run_block_jacobi_test(&ctx);
         }
-        Command::PcgUpdateScalarsTest => {
+        Cmd::PcgUpdateScalarsTest => {
             let ctx = executor::block_on(GpuContext::create(gpu_backend)).unwrap_or_else(|e| {
                 eprintln!("Failed to init GPU context: {e}");
                 process::exit(2);
@@ -610,7 +792,7 @@ fn main() {
 
             run_pcg_update_scalars_test(&ctx);
         }
-        Command::RunPcgCase {
+        Cmd::RunPcgCase {
             case_dir,
             max_iters,
             rel_tol,
@@ -693,6 +875,18 @@ fn main() {
             });
 
             println!("{json}");
+        }
+        Cmd::CompareX {
+            x_ref,
+            x,
+            rel_tol,
+            abs_tol,
+            top_k,
+        } => {
+            if let Err(e) = run_compare_x(&x_ref, &x, rel_tol, abs_tol, top_k) {
+                eprintln!("{e}");
+                process::exit(2);
+            }
         }
     }
 }

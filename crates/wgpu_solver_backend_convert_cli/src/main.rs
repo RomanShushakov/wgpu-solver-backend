@@ -43,8 +43,9 @@ struct TextDataset {
     b: Vec<f32>,
     x0: Vec<f32>,
 
-    // Per our agreement: keep it always (as input to solver too).
     block_starts: Vec<u32>,
+
+    x_ref: Option<Vec<f32>>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +59,7 @@ struct MetaJson {
     rhs_len: usize,
     x0_len: usize,
     block_starts_len: usize,
+    x_ref_present: bool,
 }
 
 /// v0 binary format for matrix.csr.bin:
@@ -112,6 +114,7 @@ fn parse_dataset_text_file(path: &Path) -> Result<TextDataset, String> {
     let mut b: Option<Vec<f32>> = None;
     let mut x0: Option<Vec<f32>> = None;
     let mut block_starts: Option<Vec<u32>> = None;
+    let mut x_ref: Option<Vec<f32>> = None;
 
     fn next_data_line<R: BufRead>(r: &mut R, buf: &mut String) -> Result<Option<String>, String> {
         loop {
@@ -285,7 +288,40 @@ fn parse_dataset_text_file(path: &Path) -> Result<TextDataset, String> {
                     expected_len,
                 )?)
             }
-            other => return Err(format!("Unknown section name: {other}")),
+            "x_ref_f32" => {
+                x_ref = Some(read_tokens_into_vec_f32(
+                    &mut r,
+                    &mut buf,
+                    &section,
+                    expected_len,
+                )?)
+            }
+            other => {
+                eprintln!("Warning: skipping unknown section: {other} (len {expected_len})");
+
+                // skip exactly expected_len tokens, ignoring line breaks
+                let mut skipped = 0usize;
+                while skipped < expected_len {
+                    buf.clear();
+                    let nread = r.read_line(&mut buf).map_err(|e| e.to_string())?;
+                    if nread == 0 {
+                        return Err(format!(
+                            "Section {other}: EOF while skipping values (skipped {}, need {})",
+                            skipped, expected_len
+                        ));
+                    }
+                    let line = buf.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if is_header_like(line) {
+                        return Err(format!(
+                            "Section {other}: hit unexpected header '{line}' before skipping len={expected_len} tokens"
+                        ));
+                    }
+                    skipped += line.split_whitespace().count();
+                }
+            }
         }
     }
 
@@ -323,6 +359,11 @@ fn parse_dataset_text_file(path: &Path) -> Result<TextDataset, String> {
             x0.len()
         ));
     }
+    if let Some(xr) = x_ref.as_ref() {
+        if xr.len() != n {
+            return Err(format!("x_ref_f32 len must be n ({}), got {}", n, xr.len()));
+        }
+    }
 
     // block_starts sanity: monotonic, first=0, last=n
     if block_starts.is_empty() {
@@ -356,6 +397,7 @@ fn parse_dataset_text_file(path: &Path) -> Result<TextDataset, String> {
         b,
         x0,
         block_starts,
+        x_ref,
     })
 }
 
@@ -420,6 +462,14 @@ fn write_bins(ds: &TextDataset, out_dir: &Path, force: bool) -> Result<(), Strin
         write_u32_slice_le(&mut f, &ds.block_starts)?;
     }
 
+    // optional x_ref.bin: [u32 n][f32[n]]
+    if let Some(x_ref) = ds.x_ref.as_ref() {
+        let mut f = File::create(out_dir.join("x_ref.bin"))
+            .map_err(|e| format!("Failed to create x_ref.bin: {e}"))?;
+        write_u32_le(&mut f, ds.n as u32)?;
+        write_f32_slice_le(&mut f, x_ref)?;
+    }
+
     // meta.json
     {
         let meta = MetaJson {
@@ -432,6 +482,7 @@ fn write_bins(ds: &TextDataset, out_dir: &Path, force: bool) -> Result<(), Strin
             rhs_len: ds.b.len(),
             x0_len: ds.x0.len(),
             block_starts_len: ds.block_starts.len(),
+            x_ref_present: ds.x_ref.is_some(),
         };
 
         let meta_text = serde_json::to_string_pretty(&meta)
@@ -446,12 +497,14 @@ fn write_bins(ds: &TextDataset, out_dir: &Path, force: bool) -> Result<(), Strin
 fn write_u32_le<W: Write>(w: &mut W, v: u32) -> Result<(), String> {
     w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())
 }
+
 fn write_u32_slice_le<W: Write>(w: &mut W, data: &[u32]) -> Result<(), String> {
     for &v in data {
         write_u32_le(w, v)?;
     }
     Ok(())
 }
+
 fn write_f32_slice_le<W: Write>(w: &mut W, data: &[f32]) -> Result<(), String> {
     for &v in data {
         w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
