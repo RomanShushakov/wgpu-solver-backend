@@ -699,6 +699,8 @@ fn run_compare_x(
     println!("  rel_l2             : {:.9e}", stats.rel_l2);
     println!("  rmse               : {:.9e}", stats.rmse);
     println!("  max_abs_err (diag) : {:.9e}", stats.max_abs_err);
+    println!("  pass_rel_l2        : {}", pass_rel);
+    println!("  pass_rmse          : {}", pass_rmse);
     println!("  pass               : {}", pass);
 
     if !stats.worst.is_empty() {
